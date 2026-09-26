@@ -74,14 +74,14 @@ jobs:
           </plist>
           EOF
 
-          # xcodegen ile tam xcodeproj üret (Citadel SPM paketi dahil)
+          # xcodegen ile tam xcodeproj üret (Citadel için iOS 17.0+ deployment target)
           cd AntigravityIDE
           cat << 'EOF' > project.yml
           name: AntigravityIDE
           options:
             bundlePrefix: com.antigravity
             deploymentTarget:
-              iOS: "16.0"
+              iOS: "17.0"
           packages:
             Citadel:
               url: https://github.com/orlandos-nl/Citadel.git
@@ -103,6 +103,7 @@ jobs:
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGN_IDENTITY: ""
                   SWIFT_VERSION: "5.0"
+                  IPHONEOS_DEPLOYMENT_TARGET: "17.0"
           EOF
 
           xcodegen generate
