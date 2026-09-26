@@ -1,0 +1,13 @@
+# macOS / System
+.DS_Store
+.item
+*.swp
+
+# Xcode / Swift
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+Payload/
+*.ipa
+*.app
