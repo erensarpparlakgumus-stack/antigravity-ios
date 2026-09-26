@@ -74,7 +74,7 @@ jobs:
           </plist>
           EOF
 
-          # xcodegen ile tam xcodeproj üret
+          # xcodegen ile tam xcodeproj üret (Citadel SPM paketi dahil)
           cd AntigravityIDE
           cat << 'EOF' > project.yml
           name: AntigravityIDE
@@ -82,11 +82,17 @@ jobs:
             bundlePrefix: com.antigravity
             deploymentTarget:
               iOS: "16.0"
+          packages:
+            Citadel:
+              url: https://github.com/orlandos-nl/Citadel.git
+              from: "0.8.0"
           targets:
             AntigravityIDE:
               type: application
               platform: iOS
               sources: [AntigravityIDE]
+              dependencies:
+                - package: Citadel
               settings:
                 base:
                   INFOPLIST_FILE: AntigravityIDE/Info.plist
