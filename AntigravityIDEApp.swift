@@ -68,7 +68,62 @@ class WorkspaceManager: ObservableObject {
     @Published var activeFileContent: String = ""
     @Published var fileBackups: [URL: [BackupVersion]] = [:]
 
+    /// AI'nin HER ZAMAN çalışabilmesi için kullanılan, uygulama sandbox'ı
+    /// içindeki varsayılan çalışma klasörü. Kullanıcı dışarıdan hiçbir
+    /// klasör seçmese bile bu klasör otomatik oluşur ve root yapılır.
+    private static let defaultWorkspaceName = "AntigravityWorkspace"
+
     private var securityScopedURL: URL?
+
+    init() {
+        // Uygulama açılır açılmaz AI'nin kullanabileceği bir klasör garanti altına alınıyor.
+        ensureDefaultWorkspaceIsActive()
+    }
+
+    /// Sandbox içinde (Documents altında) varsayılan çalışma klasörünü
+    /// oluşturur (yoksa) ve halihazırda başka bir root açık değilse onu aktif yapar.
+    @discardableResult
+    private func ensureDefaultWorkspaceIsActive() -> URL {
+        let fm = FileManager.default
+        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let defaultURL = documents.appendingPathComponent(Self.defaultWorkspaceName, isDirectory: true)
+
+        if !fm.fileExists(atPath: defaultURL.path) {
+            try? fm.createDirectory(at: defaultURL, withIntermediateDirectories: true)
+        }
+
+        if rootFolderURL == nil {
+            self.rootFolderURL = defaultURL
+            self.fileTree = buildFileTree(for: defaultURL)
+        }
+
+        return defaultURL
+    }
+
+    /// "Yeni Boş Proje" — dışarıdan izin/seçim gerektirmeden, sandbox içinde
+    /// anında yepyeni ve boş bir proje klasörü oluşturup açar.
+    func createAndOpenNewEmptyProject(named name: String = "YeniProje") {
+        releaseSecurityScopedAccessIfNeeded()
+
+        let fm = FileManager.default
+        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+
+        var candidateName = name
+        var counter = 1
+        var candidateURL = documents.appendingPathComponent(candidateName, isDirectory: true)
+        while fm.fileExists(atPath: candidateURL.path) {
+            counter += 1
+            candidateName = "\(name)\(counter)"
+            candidateURL = documents.appendingPathComponent(candidateName, isDirectory: true)
+        }
+
+        do {
+            try fm.createDirectory(at: candidateURL, withIntermediateDirectories: true)
+            setRootDirectory(candidateURL)
+        } catch {
+            print("Yeni proje klasörü oluşturulamadı: \(error.localizedDescription)")
+        }
+    }
 
     func openRoot(url: URL) {
         releaseSecurityScopedAccessIfNeeded()
@@ -80,6 +135,8 @@ class WorkspaceManager: ObservableObject {
         securityScopedURL = url
 
         if url.hasDirectoryPath {
+            // Boş klasör seçilse dahi normal şekilde root olarak ayarlanır;
+            // buildFileTree boş bir liste döndürse dahi sorun oluşturmaz.
             setRootDirectory(url)
         } else {
             loadFile(url: url)
@@ -98,6 +155,8 @@ class WorkspaceManager: ObservableObject {
     func setRootDirectory(_ url: URL) {
         self.rootFolderURL = url
         self.fileTree = buildFileTree(for: url)
+        self.activeFileURL = nil
+        self.activeFileContent = ""
     }
 
     func refreshTree() {
@@ -146,6 +205,7 @@ class WorkspaceManager: ObservableObject {
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else {
+            // Klasör boşsa veya okunamazsa boş liste döner — hata fırlatılmaz.
             return []
         }
 
@@ -201,7 +261,14 @@ class WorkspaceManager: ObservableObject {
                 }
             }
         }
-        return aggregatedContext.isEmpty ? activeFileContent : aggregatedContext
+
+        // Klasör tamamen boşsa bile AI'ye "boş bir proje" olduğu bilgisini veriyoruz,
+        // böylece AI hiçbir context bulunmadığında bile normal şekilde dosya oluşturabilir.
+        if aggregatedContext.isEmpty {
+            let name = rootURL.lastPathComponent
+            return "(Proje klasörü '\(name)' şu anda tamamen boş. Hiç dosya yok. Sıfırdan dosya/klasör oluşturabilirsin.)"
+        }
+        return aggregatedContext
     }
 
     func relativePath(for url: URL, from root: URL) -> String {
@@ -216,13 +283,11 @@ class WorkspaceManager: ObservableObject {
     }
 
     enum AgentFileError: Error, LocalizedError {
-        case noRoot
         case invalidPath
         case fsError(String)
 
         var errorDescription: String? {
             switch self {
-            case .noRoot: return "Önce bir proje klasörü açmalısınız."
             case .invalidPath: return "Geçersiz veya güvensiz dosya yolu."
             case .fsError(let msg): return msg
             }
@@ -230,7 +295,9 @@ class WorkspaceManager: ObservableObject {
     }
 
     private func resolvedURL(forRelativePath path: String) throws -> URL {
-        guard let root = rootFolderURL else { throw AgentFileError.noRoot }
+        // Artık root her zaman garanti: eğer hiç açılmadıysa varsayılan
+        // sandbox workspace'i burada otomatik devreye giriyor.
+        let root = rootFolderURL ?? ensureDefaultWorkspaceIsActive()
         let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty, !cleaned.contains("..") else { throw AgentFileError.invalidPath }
         return root.appendingPathComponent(cleaned)
@@ -322,7 +389,9 @@ class OpenRouterEngine: ObservableObject {
         if agentModeEnabled {
             return """
             You are Antigravity Agent, an autonomous mobile coding agent with direct read/write access \
-            to the user's project folder. You do not just suggest code — you make the changes yourself.
+            to the user's project folder. You do not just suggest code — you make the changes yourself. \
+            This includes fully empty projects: if the workspace is empty, create files and folders from scratch \
+            without asking for permission first.
 
             You MUST respond with ONLY a single valid JSON object, no markdown fences, no prose outside JSON:
             {
@@ -498,6 +567,9 @@ class RealSSHClient: ObservableObject {
                 host: config.host,
                 port: config.port,
                 authenticationMethod: authMethod,
+                // NOT: .acceptAnything() geliştirme/test için kullanılır. Üretimde
+                // MITM saldırılarına karşı .trustedHostKeys([...]) ile sabit host key
+                // doğrulaması yapılması güçlü şekilde önerilir.
                 hostKeyValidator: .acceptAnything(),
                 reconnect: .never
             )
@@ -513,6 +585,7 @@ class RealSSHClient: ObservableObject {
         isConnecting = false
     }
 
+    /// PEM formatlı anahtar metninden önce Ed25519, olmazsa RSA olarak parse etmeyi dener.
     private static func buildKeyAuthMethod(username: String, pemKey: String) throws -> SSHAuthenticationMethod {
         if let ed25519 = try? Curve25519.Signing.PrivateKey(sshEd25519: pemKey) {
             return .ed25519(username: username, privateKey: ed25519)
@@ -543,6 +616,7 @@ class RealSSHClient: ObservableObject {
         append("[SSH]: Bağlantı kapatıldı.")
     }
 
+    /// Uzak sunucuda gerçek komut çalıştırır ve tüm stdout+stderr çıktısını döndürür.
     func execute(_ command: String) async {
         guard let client = client else {
             append("⚠️ Önce sunucuya bağlanmalısınız.")
@@ -585,7 +659,7 @@ struct MainIDEView: View {
     @State private var isTerminalSheetPresented = false
     @State private var aiInputPrompt: String = ""
     @State private var chatHistory: [ChatMessage] = [
-        ChatMessage(role: "AI", text: "Antigravity IDE Hazır. Sol panelden proje klasörünüzü seçin. Agent modu açıkken AI, dosyalarınızı doğrudan oluşturabilir, düzenleyebilir veya silebilir.")
+        ChatMessage(role: "AI", text: "Antigravity IDE Hazır. AI her zaman kullanılabilir — boş bir klasör seçsen de, hiç klasör seçmesen de AI kendi çalışma alanında dosya oluşturabilir, düzenleyebilir veya silebilir.")
     ]
 
     let keySymbols = ["{", "}", "[", "]", "(", ")", "<", ">", ";", "=", "+", "-", "*", "/", "\""]
@@ -598,10 +672,17 @@ struct MainIDEView: View {
                         .font(.system(size: 11, weight: .black, design: .monospaced))
                         .foregroundColor(.gray)
                     Spacer()
+                    Button(action: { workspace.createAndOpenNewEmptyProject() }) {
+                        Image(systemName: "plus.rectangle.on.folder")
+                            .foregroundColor(.green)
+                    }
+                    .help("Yeni boş proje klasörü oluştur (izin gerekmez)")
+
                     Button(action: { isFileImporterPresented = true }) {
                         Image(systemName: "folder.badge.plus")
                             .foregroundColor(.accentColor)
                     }
+                    .help("Dışarıdan bir klasör seç")
                 }
                 .padding()
                 .background(Color(white: 0.1))
@@ -612,8 +693,13 @@ struct MainIDEView: View {
                             Label(root.lastPathComponent, systemImage: "folder.fill")
                                 .font(.footnote)
                                 .foregroundColor(.yellow)
+                            if workspace.fileTree.isEmpty {
+                                Text("Klasör boş — AI buraya dosya oluşturabilir.")
+                                    .font(.caption2)
+                                    .foregroundColor(.gray)
+                            }
                         } else {
-                            Text("Henüz bir klasör açılmadı.")
+                            Text("Çalışma alanı hazırlanıyor...")
                                 .font(.footnote)
                                 .foregroundColor(.gray)
                         }
@@ -692,6 +778,7 @@ struct MainIDEView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(.blue)
+                            .disabled(workspace.activeFileURL == nil)
                         }
                         .padding(10)
                         .background(Color(white: 0.12))
@@ -728,6 +815,7 @@ struct MainIDEView: View {
                     Divider()
                         .background(Color.gray.opacity(0.3))
 
+                    // AI PANELİ — workspace durumundan bağımsız, HER ZAMAN aktif.
                     VStack(spacing: 0) {
                         HStack {
                             Image(systemName: "cpu")
@@ -757,7 +845,7 @@ struct MainIDEView: View {
                             HStack {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundColor(.orange)
-                                Text("Agent Modu Açık — AI dosyaları doğrudan oluşturabilir, düzenleyebilir veya silebilir.")
+                                Text("Agent Modu Açık — AI dosyaları doğrudan oluşturabilir, düzenleyebilir veya silebilir. Klasör boş olsa bile çalışır.")
                                     .font(.caption2)
                                     .foregroundColor(.orange)
                             }
@@ -807,8 +895,10 @@ struct MainIDEView: View {
 
                         Divider()
 
+                        // Not: Bu alan asla `disabled` ile kilitlenmiyor — workspace
+                        // boş/hazır olmasa bile kullanıcı her zaman AI'ye yazabilir.
                         HStack {
-                            TextField("Kod ile ilgili komut veya soru yazın...", text: $aiInputPrompt)
+                            TextField("Kod ile ilgili komut veya soru yazın... (boş klasörde bile çalışır)", text: $aiInputPrompt)
                                 .textFieldStyle(.plain)
                                 .font(.footnote)
                                 .padding(8)
@@ -826,7 +916,7 @@ struct MainIDEView: View {
                                         .foregroundColor(.accentColor)
                                 }
                             }
-                            .disabled(aiEngine.isProcessing)
+                            .disabled(aiEngine.isProcessing || aiInputPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                         .padding(10)
                         .background(Color(white: 0.08))
@@ -845,6 +935,7 @@ struct MainIDEView: View {
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
+                // Boş klasör dahil, seçilen her klasör doğrudan açılır.
                 workspace.openRoot(url: url)
             case .failure(let error):
                 print("Dosya seçimi başarısız: \(error.localizedDescription)")
@@ -865,6 +956,8 @@ struct MainIDEView: View {
         chatHistory.append(ChatMessage(role: "Siz", text: trimmed))
         aiInputPrompt = ""
 
+        // Workspace boş olsa, hatta hiç kullanıcı seçimi yapılmamış olsa bile
+        // extractFullWorkspaceContext ve applyAgentAction artık her zaman güvenli.
         let workspaceContext = workspace.extractFullWorkspaceContext()
 
         aiEngine.executeAIQuery(prompt: trimmed, context: workspaceContext) { explanation, actions in
@@ -1037,7 +1130,7 @@ struct SettingsView: View {
 
                 Section(
                     header: Text("Agent Modu"),
-                    footer: Text("Agent modu açıkken AI, proje klasörünüzdeki dosyaları sizin onayınız olmadan doğrudan oluşturabilir, düzenleyebilir veya silebilir. Kapalıyken sadece öneri metni döner, dosyalara dokunmaz.")
+                    footer: Text("Agent modu açıkken AI, proje klasörünüzdeki dosyaları sizin onayınız olmadan doğrudan oluşturabilir, düzenleyebilir veya silebilir (boş klasörler dahil). Kapalıyken sadece öneri metni döner, dosyalara dokunmaz.")
                 ) {
                     Toggle("Dosyaları doğrudan değiştirmesine izin ver", isOn: $aiEngine.agentModeEnabled)
                 }
